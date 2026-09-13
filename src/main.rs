@@ -1,11 +1,32 @@
 use std::io::{self, Write};
 
+#[derive(Debug)]
+enum Role {
+    User,
+    Forge,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Role::User => write!(f, "user: "),
+            Role::Forge => write!(f, "forge: "),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Message {
+    role: Role,
+    content: String,
+}
+
 fn main() -> Result<(), std::io::Error> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let input = &mut String::new();
 
-    let mut conversation: Vec<String> = Vec::new();
+    let mut conversation: Vec<Message> = Vec::new();
 
     loop {
         stdout.write_all(b"forge> ")?;
@@ -23,6 +44,10 @@ fn main() -> Result<(), std::io::Error> {
 
         if input.trim_end() == "/history" {
             for line in &conversation {
+                let role = &line.role;
+                let content = &line.content;
+
+                let line = format!("{role}{content}");
                 stdout.write_all(line.as_bytes())?;
                 stdout.write_all(b"\n")?;
             }
@@ -36,13 +61,16 @@ fn main() -> Result<(), std::io::Error> {
 
         stdout.write_all(input.as_bytes())?;
 
-        let mut user_input = "user: ".to_owned();
-        user_input.push_str(input.trim());
-
+        let user_input = Message {
+            role: Role::User,
+            content: input.trim().to_string(),
+        };
         conversation.push(user_input);
 
-        let mut forge_answer = "forge: ".to_owned();
-        forge_answer.push_str(input.trim());
+        let forge_answer = Message {
+            role: Role::Forge,
+            content: input.trim().to_string(),
+        };
         conversation.push(forge_answer);
     }
 }

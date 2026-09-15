@@ -55,6 +55,15 @@ fn main() -> Result<(), std::io::Error> {
             continue;
         }
 
+        if input.trim_end() == "/clear" {
+            conversation.clear();
+
+            stdout.write_all(b"conversation cleared")?;
+            stdout.write_all(b"\n")?;
+
+            continue;
+        }
+
         if input.trim().is_empty() {
             continue;
         }

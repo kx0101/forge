@@ -1,10 +1,18 @@
 use std::io::Write;
 use std::io::{self, BufRead};
 
-#[derive(Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum Role {
+    #[serde(rename = "user")]
     User,
+
+    #[serde(rename = "assistant")]
     Forge,
+
+    #[serde(rename = "system")]
+    System,
 }
 
 impl std::fmt::Display for Role {
@@ -12,11 +20,12 @@ impl std::fmt::Display for Role {
         match self {
             Role::User => write!(f, "user: "),
             Role::Forge => write!(f, "forge: "),
+            Role::System => write!(f, "system: "),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Message {
     role: Role,
     content: String,
@@ -26,6 +35,107 @@ struct Message {
 enum Command {
     History,
     Clear,
+}
+
+#[derive(Clone)]
+struct EchoModel;
+
+#[derive(Debug)]
+enum AppError {
+    Io(std::io::Error),
+    Model(ModelError),
+    Reqwest(reqwest::Error),
+}
+
+#[derive(Debug)]
+struct ModelError {
+    message: String,
+}
+
+impl From<reqwest::Error> for ModelError {
+    fn from(error: reqwest::Error) -> Self {
+        ModelError {
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<std::io::Error> for AppError {
+    fn from(error: std::io::Error) -> Self {
+        AppError::Io(error)
+    }
+}
+
+impl From<ModelError> for AppError {
+    fn from(error: ModelError) -> Self {
+        AppError::Model(error)
+    }
+}
+
+trait Model {
+    fn respond(&self, conversation: &[Message]) -> Result<Option<Message>, ModelError>;
+}
+
+impl Model for EchoModel {
+    fn respond(&self, conversation: &[Message]) -> Result<Option<Message>, ModelError> {
+        let message_to_echo = conversation.last();
+        if message_to_echo.is_none() {
+            return Ok(None);
+        }
+
+        let forge_answer = Message {
+            role: Role::Forge,
+            content: message_to_echo.unwrap().content.trim().to_string(),
+        };
+
+        Ok(Some(forge_answer))
+    }
+}
+
+struct OllamaModel {
+    endpoint: String,
+    model_name: String,
+}
+
+#[derive(Serialize)]
+struct OllamaRequest<'a> {
+    model: String,
+    messages: &'a [Message],
+    stream: bool,
+}
+
+#[derive(Deserialize)]
+struct OllamaResponse {
+    message: Message,
+}
+
+impl OllamaModel {
+    fn new() -> Self {
+        OllamaModel {
+            endpoint: String::from("http://127.0.0.1:11434"),
+            model_name: String::from("qwen3.5:9b"),
+        }
+    }
+}
+
+impl Model for OllamaModel {
+    fn respond(&self, conversation: &[Message]) -> Result<Option<Message>, ModelError> {
+        let request = OllamaRequest {
+            model: self.model_name.to_string(),
+            messages: conversation,
+            stream: false,
+        };
+
+        let client = reqwest::blocking::Client::new();
+        let response = client
+            .post(format!("{}/api/chat", self.endpoint))
+            .json(&request)
+            .send()?
+            .error_for_status()?
+            .json::<OllamaResponse>()?;
+
+        Ok(Some(response.message))
+    }
 }
 
 fn get_command(input: &str) -> Option<Command> {
@@ -40,11 +150,15 @@ fn get_command(input: &str) -> Option<Command> {
     None
 }
 
-fn get_history<W>(conversation: &Vec<Message>, writer: &mut W) -> Result<(), std::io::Error>
+fn get_history<W>(conversation: &[Message], writer: &mut W) -> Result<(), std::io::Error>
 where
     W: Write,
 {
     for line in conversation {
+        if line.role == Role::System {
+            continue;
+        }
+
         let role = &line.role;
         let content = &line.content;
 
@@ -60,7 +174,7 @@ fn clear<W>(conversation: &mut Vec<Message>, writer: &mut W) -> Result<(), std::
 where
     W: Write,
 {
-    conversation.clear();
+    conversation.retain(|message| message.role == Role::System);
 
     writer.write_all(b"conversation cleared")?;
     writer.write_all(b"\n")?;
@@ -68,13 +182,20 @@ where
     Ok(())
 }
 
-fn run<R, W>(reader: &mut R, writer: &mut W) -> Result<(), std::io::Error>
+fn run<R, W, M>(reader: &mut R, writer: &mut W, model: &M) -> Result<(), AppError>
 where
     R: BufRead,
     W: Write,
+    M: Model,
 {
     let input = &mut String::new();
     let mut conversation: Vec<Message> = Vec::new();
+
+    let system_prompt = Message {
+        role: Role::System,
+        content: "You are Forge, an interactive coding assistant.".to_string(),
+    };
+    conversation.push(system_prompt);
 
     loop {
         writer.write_all(b"forge> ")?;
@@ -106,37 +227,75 @@ where
             return Ok(());
         }
 
-        writer.write_all(input.as_bytes())?;
-
         let user_input = Message {
             role: Role::User,
             content: input.trim().to_string(),
         };
         conversation.push(user_input);
 
-        let forge_answer = Message {
-            role: Role::Forge,
-            content: input.trim().to_string(),
+        if let Some(answer) = model.respond(&conversation)? {
+            writer.write_all(answer.content.as_bytes())?;
+            writer.write_all(b"\n")?;
+
+            conversation.push(answer);
         };
-        conversation.push(forge_answer);
     }
 }
 
-fn main() -> Result<(), std::io::Error> {
+fn main() -> Result<(), AppError> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
 
     let stdout = io::stdout();
     let mut writer = stdout.lock();
 
-    run(&mut reader, &mut writer)
+    let model = OllamaModel::new();
+
+    run(&mut reader, &mut writer, &model)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::io::BufReader;
 
     use super::*;
+    struct PanicModel;
+
+    impl Model for PanicModel {
+        fn respond(&self, _conversation: &[Message]) -> Result<Option<Message>, ModelError> {
+            panic!("model should not have been called");
+        }
+    }
+
+    struct FakeModel;
+
+    impl Model for FakeModel {
+        fn respond(&self, _conversation: &[Message]) -> Result<Option<Message>, ModelError> {
+            let generated_message = Message {
+                role: Role::Forge,
+                content: "generated response".to_string(),
+            };
+
+            Ok(Some(generated_message))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingModel {
+        conversations: RefCell<Vec<Vec<Message>>>,
+    }
+
+    impl Model for RecordingModel {
+        fn respond(&self, conversation: &[Message]) -> Result<Option<Message>, ModelError> {
+            self.conversations.borrow_mut().push(conversation.to_vec());
+
+            Ok(Some(Message {
+                role: Role::Forge,
+                content: "recorded".to_string(),
+            }))
+        }
+    }
 
     #[test]
     fn test_normal_conversation() {
@@ -146,7 +305,9 @@ mod tests {
 
         let mut writer: Vec<u8> = Vec::new();
 
-        let result = run(&mut reader, &mut writer);
+        let model = EchoModel;
+
+        let result = run(&mut reader, &mut writer, &model);
 
         assert!(result.is_ok());
         assert_eq!(writer, expected_output.as_bytes())
@@ -160,7 +321,9 @@ mod tests {
 
         let mut writer: Vec<u8> = Vec::new();
 
-        let result = run(&mut reader, &mut writer);
+        let model = EchoModel;
+
+        let result = run(&mut reader, &mut writer, &model);
 
         assert!(result.is_ok());
         assert_eq!(writer, expected_output.as_bytes())
@@ -175,7 +338,9 @@ mod tests {
 
         let mut writer: Vec<u8> = Vec::new();
 
-        let result = run(&mut reader, &mut writer);
+        let model = EchoModel;
+
+        let result = run(&mut reader, &mut writer, &model);
 
         assert!(result.is_ok());
         assert_eq!(writer, expected_output.as_bytes());
@@ -189,7 +354,9 @@ mod tests {
 
         let mut writer: Vec<u8> = Vec::new();
 
-        let result = run(&mut reader, &mut writer);
+        let model = EchoModel;
+
+        let result = run(&mut reader, &mut writer, &model);
 
         assert!(result.is_ok());
         assert_eq!(writer, expected_output.as_bytes());
@@ -203,7 +370,9 @@ mod tests {
 
         let mut writer: Vec<u8> = Vec::new();
 
-        let result = run(&mut reader, &mut writer);
+        let model = EchoModel;
+
+        let result = run(&mut reader, &mut writer, &model);
 
         assert!(result.is_ok());
         assert_eq!(writer, expected_output.as_bytes());
@@ -228,5 +397,91 @@ mod tests {
         let input = "whats up there";
         let command = get_command(input);
         assert_eq!(command, None);
+    }
+
+    #[test]
+    fn test_fake_model_different_output() {
+        let input = "hello";
+        let mut reader = BufReader::new(input.as_bytes());
+        let expected_output = "forge> generated response\nforge> ";
+
+        let mut writer: Vec<u8> = Vec::new();
+
+        let model = FakeModel;
+
+        let result = run(&mut reader, &mut writer, &model);
+
+        assert!(result.is_ok());
+        assert_eq!(writer, expected_output.as_bytes())
+    }
+
+    #[test]
+    fn commands_and_empty_input_do_not_call_model() {
+        let input = "/history\n/clear\n   \nexit\n";
+        let expected_output = "forge> forge> conversation cleared\nforge> forge> ";
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut writer = Vec::new();
+        let model = PanicModel;
+
+        let result = run(&mut reader, &mut writer, &model);
+
+        assert!(result.is_ok());
+        assert_eq!(writer, expected_output.as_bytes())
+    }
+
+    #[test]
+    fn model_receives_system_message_first() {
+        let input = "hello\nexit\n";
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut writer = Vec::new();
+        let model = RecordingModel::default();
+
+        run(&mut reader, &mut writer, &model).unwrap();
+
+        let conversations = model.conversations.borrow();
+        let first_call = &conversations[0];
+        assert!(matches!(first_call[0].role, Role::System));
+        assert_eq!(
+            first_call[0].content,
+            "You are Forge, an interactive coding assistant."
+        );
+        assert!(matches!(first_call[1].role, Role::User));
+        assert_eq!(first_call[1].content, "hello");
+    }
+
+    #[test]
+    fn clear_preserves_system_message_for_next_model_call() {
+        let input = "before\n/clear\nafter\nexit\n";
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut writer = Vec::new();
+        let model = RecordingModel::default();
+
+        run(&mut reader, &mut writer, &model).unwrap();
+
+        let conversations = model.conversations.borrow();
+        let second_call = &conversations[1];
+        assert_eq!(second_call.len(), 2);
+        assert!(matches!(second_call[0].role, Role::System));
+        assert_eq!(
+            second_call[0].content,
+            "You are Forge, an interactive coding assistant."
+        );
+        assert!(matches!(second_call[1].role, Role::User));
+        assert_eq!(second_call[1].content, "after");
+    }
+
+    #[test]
+    fn history_does_not_display_system_message() {
+        let input = "hello\n/history\nexit\n";
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut writer = Vec::new();
+        let model = EchoModel;
+
+        run(&mut reader, &mut writer, &model).unwrap();
+
+        let output = String::from_utf8(writer).unwrap();
+        assert!(!output.contains("system:"));
+        assert!(!output.contains("You are Forge, an interactive coding assistant."));
+        assert!(output.contains("user: hello\nforge: hello\n"));
     }
 }

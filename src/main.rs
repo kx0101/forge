@@ -52,6 +52,12 @@ struct ModelError {
     message: String,
 }
 
+impl std::fmt::Display for ModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[Error] {}", self.message)
+    }
+}
+
 impl From<reqwest::Error> for ModelError {
     fn from(error: reqwest::Error) -> Self {
         ModelError {
@@ -233,12 +239,18 @@ where
         };
         conversation.push(user_input);
 
-        if let Some(answer) = model.respond(&conversation)? {
-            writer.write_all(answer.content.as_bytes())?;
-            writer.write_all(b"\n")?;
+        match model.respond(&conversation) {
+            Ok(Some(answer)) => {
+                writer.write_all(answer.content.as_bytes())?;
+                writer.write_all(b"\n")?;
 
-            conversation.push(answer);
-        };
+                conversation.push(answer);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                writeln!(writer, "forge> {err}")?;
+            }
+        }
     }
 }
 
@@ -256,7 +268,7 @@ fn main() -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::io::BufReader;
 
     use super::*;
@@ -293,6 +305,32 @@ mod tests {
             Ok(Some(Message {
                 role: Role::Forge,
                 content: "recorded".to_string(),
+            }))
+        }
+    }
+
+    #[derive(Default)]
+    struct FailOnceModel {
+        calls: Cell<usize>,
+        conversations: RefCell<Vec<Vec<Message>>>,
+    }
+
+    impl Model for FailOnceModel {
+        fn respond(&self, conversation: &[Message]) -> Result<Option<Message>, ModelError> {
+            self.conversations.borrow_mut().push(conversation.to_vec());
+
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+
+            if call == 0 {
+                return Err(ModelError {
+                    message: "temporary failure".to_string(),
+                });
+            }
+
+            Ok(Some(Message {
+                role: Role::Forge,
+                content: "recovered".to_string(),
             }))
         }
     }
@@ -483,5 +521,31 @@ mod tests {
         assert!(!output.contains("system:"));
         assert!(!output.contains("You are Forge, an interactive coding assistant."));
         assert!(output.contains("user: hello\nforge: hello\n"));
+    }
+
+    #[test]
+    fn model_failure_keeps_session_open_and_preserves_user_message() {
+        let input = "first\nsecond\nexit\n";
+        let mut reader = BufReader::new(input.as_bytes());
+        let mut writer = Vec::new();
+        let model = FailOnceModel::default();
+
+        let result = run(&mut reader, &mut writer, &model);
+
+        assert!(result.is_ok());
+        assert_eq!(model.calls.get(), 2);
+        assert_eq!(
+            writer,
+            b"forge> forge> [Error] temporary failure\nforge> recovered\nforge> "
+        );
+
+        let conversations = model.conversations.borrow();
+        let second_call = &conversations[1];
+        assert_eq!(second_call.len(), 3);
+        assert!(matches!(second_call[0].role, Role::System));
+        assert!(matches!(second_call[1].role, Role::User));
+        assert_eq!(second_call[1].content, "first");
+        assert!(matches!(second_call[2].role, Role::User));
+        assert_eq!(second_call[2].content, "second");
     }
 }
